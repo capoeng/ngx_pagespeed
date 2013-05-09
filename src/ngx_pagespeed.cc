@@ -1691,7 +1691,7 @@ ngx_int_t ps_write_response_handler(ngx_http_request_t *r) {
 	  }
 	}
 
-    if (ctx->modify_headers) {
+    if (ctx->modify_headers || !ctx->do_rewrite) {
       ngx_http_clean_header(r);
       rc = ctx->base_fetch->CollectHeaders(&r->headers_out);
       if (rc == NGX_ERROR) {
@@ -1709,6 +1709,8 @@ ngx_int_t ps_write_response_handler(ngx_http_request_t *r) {
     ctx->write_pending = (rc == NGX_AGAIN);
 
     if (r->header_only) {
+      // TODO: ctx->base_fetch->Release();
+      // ctx->base_fetch = NULL;
       ctx->fetch_done = true;
       return rc;
     }
@@ -1732,7 +1734,9 @@ ngx_int_t ps_write_response_handler(ngx_http_request_t *r) {
 
   if (rc == NGX_OK) {
     ps_set_buffered(r, false);
-	ctx->fetch_done = true;
+    ctx->fetch_done = true;
+    // TODO: ctx->base_fetch->Release();
+    // ctx->base_fetch = NULL;
   }
 
   // TODO: only call ctx->next_body_filter
@@ -1942,24 +1946,24 @@ ngx_int_t ps_inplace_body_filter(ngx_http_request_t *r, ngx_chain_t *in) {
 
     CHECK(ngx_buf_in_memory(cl->buf));
     StringPiece contents(reinterpret_cast<char *>(cl->buf->pos), ngx_buf_size(cl->buf));
-    
+
     recorder->Write(contents, recorder->handler());
 
-	if (cl->buf->flush) {
+    if (cl->buf->flush) {
       recorder->Flush(recorder->handler());
-	}
+    }
 
     if (cl->buf->last_buf) {
       ResponseHeaders response_headers;
 
-	  // TODO: copy header
+      copy_response_headers_from_ngx(r, &response_headers);
 
       ctx->recorder->DoneAndSetHeaders(&response_headers);
       ctx->recorder = NULL;
       break;
     }
   }
-  
+
   return ngx_http_next_body_filter(r, in);
 }
 
@@ -2402,7 +2406,6 @@ void ps_beacon_body_handler(ngx_http_request_t* r) {
   ngx_http_finalize_request(r, rc);
 }
 
-
 ngx_int_t ps_beacon_handler(ngx_http_request_t* r) {
   if (r->method == NGX_HTTP_POST) {
     // Use post body. Handler functions are called before the request body has
@@ -2467,6 +2470,7 @@ ngx_int_t ps_inplace_checker(ngx_http_request_t *r) {
 
   bool status_ok = (status_code != 0) && (status_code < 400);
 
+  // continue process
   if (status_ok) {
     return NGX_OK;
   }
@@ -2489,14 +2493,16 @@ ngx_int_t ps_inplace_checker(ngx_http_request_t *r) {
     // (or at least a note that it cannot be cached stored there).
     // We do that using an Apache output filter.
     ctx->recorder = new InPlaceResourceRecorder(
-        ctx->url.Spec(), request_headers.release(), ctx->driver->options()->respect_vary(),
-        server_context->http_cache(), server_context->statistics(),
-        message_handler);
+           ctx->url.Spec(), request_headers.release(), ctx->driver->options()->respect_vary(),
+           server_context->http_cache(), server_context->statistics(),
+           message_handler);
   } else {
     server_context->rewrite_stats()->ipro_not_rewritable()->Add(1);
     message_handler->Message(kInfo, "Could not rewrite resource in-place: %s", 
            ctx->url.Spec().as_string().c_str());
   }
+  // TODO: ctx->base_fetch->Release();
+  // ctx->base_fetch = NULL;
   return NGX_DECLINED;
 }
 

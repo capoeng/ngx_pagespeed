@@ -2836,8 +2836,8 @@ ngx_int_t ps_aux_filter_init(ngx_conf_t* cf) {
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ps_html_rewrite_header_filter;
 /*
-	ps_aux_next_body_filter = ngx_http_top_body_filter;
-	ngx_http_top_body_filter = ps_aux_body_filter;
+    ps_aux_next_body_filter = ngx_http_top_body_filter;
+    ngx_http_top_body_filter = ps_aux_body_filter;
 */
   }
 

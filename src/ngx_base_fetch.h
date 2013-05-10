@@ -129,6 +129,10 @@ class NgxBaseFetch : public AsyncFetch {
   // set by RequestCollection, cleared by CollectAccumulatedWrites
   volatile bool flush_;
 
+  static ngx_connection_t *pipe_conn_;
+  static int pipefds_[2];
+
+
   DISALLOW_COPY_AND_ASSIGN(NgxBaseFetch);
 };
 

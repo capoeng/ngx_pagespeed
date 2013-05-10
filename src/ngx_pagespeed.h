@@ -37,7 +37,8 @@ extern "C" {
 
 #include "net/instaweb/http/public/response_headers.h"
 #include "net/instaweb/util/public/string_util.h"
-
+#include "net/instaweb/apache/in_place_resource_recorder.h"
+#include "net/instaweb/util/public/google_url.h"
 namespace net_instaweb {
 
 class GzipInflater;
@@ -81,14 +82,33 @@ ngx_int_t copy_response_headers_to_ngx(
     const net_instaweb::ResponseHeaders& pagespeed_headers);
 
 typedef struct {
-  net_instaweb::ProxyFetch* proxy_fetch;
-  net_instaweb::NgxBaseFetch* base_fetch;
+
+  // for common use
   ngx_http_request_t* r;
-  bool is_resource_fetch;
+  
+  net_instaweb::NgxBaseFetch* base_fetch;
+
+  // for html rewrite
+  net_instaweb::ProxyFetch* proxy_fetch;
+  net_instaweb::GzipInflater* inflater_;
+
+  // for in place resource 
+  net_instaweb::RewriteDriver *driver;
+  net_instaweb::InPlaceResourceRecorder* recorder;
+  
+  net_instaweb::GoogleUrl url;
+
+  // do html rewrite
+  bool do_rewrite;
+
+  // use to handle pagespeed output
   bool write_pending;
   bool modify_headers;
   bool fetch_done;
-  net_instaweb::GzipInflater* inflater_;
+
+  ngx_http_output_header_filter_pt  next_header_filter;
+  ngx_http_output_body_filter_pt    next_body_filter;
+  ngx_http_handler_pt               response_checker;
 } ps_request_ctx_t;
 
 // called by net_instaweb::NgxBaseFetch to notify event

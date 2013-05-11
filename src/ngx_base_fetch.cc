@@ -29,15 +29,101 @@ namespace net_instaweb {
 	
 ngx_connection_t *NgxBaseFetch::pipe_conn_ = NULL;
 int NgxBaseFetch::pipefds_[2] = {-1, -1};
+AtomicInt32 NgxBaseFetch::count_;
 
-	
+
+ngx_int_t NgxBaseFetch::Initialize(ngx_cycle_t *cycle) {
+  ps_main_conf_t* cfg_m = static_cast<ps_main_conf_t*>(
+		 ngx_http_cycle_get_module_main_conf(cycle, ngx_pagespeed));
+  
+  if (::pipe(pipefds_) != 0) {
+	cfg_m->handler->Message(net_instaweb::kError, "base fetch pipe() failed");
+	return NGX_ERROR;
+  }
+
+  // following codes are modified from ngx_add_channel_event
+  // we have to save ngx_connection_t, so can not use ngx_add_channel_event
+  ngx_event_t *rev, *wev;
+  ngx_connection_t *c;
+
+  c = ngx_get_connection(pipefds_[0], cycle->log);
+
+  if (c == NULL) {
+    if (close(pipefds_[0]) == -1) {
+      ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+  	              "close() NgxBaseFetch read fd failed");
+    }
+    if (close(pipefds_[1]) == -1) {
+      ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+  	              "close() NgxBaseFetch write fd failed");
+    }
+	return NGX_ERROR;
+  }
+
+  if (ngx_nonblocking(pipefds_[0]) == -1) {
+		cfg_m->handler->Message(net_instaweb::kError,
+		"base fetch pipe[0] " ngx_nonblocking_n " failed");
+	goto failed;
+  }
+
+  c->pool = cycle->pool;
+
+  rev = c->read;
+  wev = c->write;
+
+  rev->log = cycle->log;
+  wev->log = cycle->log;
+
+#if (NGX_THREADS)
+  rev->lock = &c->lock;
+  wev->lock = &c->lock;
+  rev->own_lock = &c->lock;
+  wev->own_lock = &c->lock;
+#endif
+
+  rev->channel = 1;
+  wev->channel = 1;
+
+  rev->handler = NgxBaseFetch::event_handler;
+
+  // only EPOLL event has both add_event and add_connection
+  // same as ngx_add_channel_event
+  if (ngx_add_conn && (ngx_event_flags & NGX_USE_EPOLL_EVENT) == 0) {
+	if (ngx_add_conn(c) == NGX_ERROR) {
+	  goto failed;
+	}
+  } else {
+	if (ngx_add_event(rev, NGX_READ_EVENT, 0) == NGX_ERROR) {
+	  goto failed;
+	}
+  }
+
+  pipe_conn_ = c;
+  return NGX_OK;
+failed:
+  ngx_close_connection(pipe_conn_);
+  if (close(pipefds_[1]) == -1) {
+	ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+		"close() base fetch pipe[1] failed");
+  }
+  return NGX_ERROR;
+}
+
+void NgxBaseFetch::Terminate(ngx_cycle_t *cycle) {
+  ngx_close_connection(pipe_conn_);
+  if (close(pipefds_[1]) == -1) {
+	ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+		 "close() NgxBaseFetch channel write fd failed");
+  }
+}
+
 // handle base fetch event(Flush/HeadersComplete/Done),
 // and ignore the event corresponding to SKIP.
 // SKIP should only be specified in ps_release_request_context,
 // so that released base fetch event will be ignored.
 //
 // modified from ngx_channel_handler
-void NgxBaseFetch::clear_pipe(ngx_http_request_t *skip = NULL) {
+void NgxBaseFetch::ProcessPipe(ngx_http_request_t *skip = NULL) {
   for ( ;; ) {
 	ngx_http_request_t *requests[512];
 	ssize_t size = read(pipe_conn_->fd,
@@ -79,118 +165,8 @@ void NgxBaseFetch::event_handler(ngx_event_t *ev) {
 	ev->timedout = 0;
 	return;
   }
-  ngx_log_debug0(NGX_LOG_DEBUG_EVENT, ev->log, 0, "base fetch event handler");
-  clear_pipe(NULL);
-}
-
-ngx_int_t NgxBaseFetch::init(ngx_cycle_t *cycle) {
-  ps_main_conf_t* cfg_m = static_cast<ps_main_conf_t*>(
-		 ngx_http_cycle_get_module_main_conf(cycle, ngx_pagespeed));
-
-  if (pipefds_[0] != -1) {
-    return NGX_OK;
-  }
-  
-  if (::pipe(pipefds_) != 0) {
-	cfg_m->handler->Message(net_instaweb::kError, "base fetch pipe() failed");
-	return NGX_ERROR;
-  }
-
-  if (ngx_nonblocking(pipefds_[0]) == -1) {
-		cfg_m->handler->Message(net_instaweb::kError,
-		"base fetch pipe[0] " ngx_nonblocking_n " failed");
-	goto failed;
-  }
-
-  // following codes are modified from ngx_add_channel_event
-  // we have to save ngx_connection_t, so can not use ngx_add_channel_event
-  ngx_event_t *rev, *wev;
-  ngx_connection_t *c;
-
-  c = ngx_get_connection(pipefds_[0], cycle->log);
-
-  if (c == NULL) {
-	goto failed;
-  }
-
-  c->pool = cycle->pool;
-
-  rev = c->read;
-  wev = c->write;
-
-  rev->log = cycle->log;
-  wev->log = cycle->log;
-
-#if (NGX_THREADS)
-  rev->lock = &c->lock;
-  wev->lock = &c->lock;
-  rev->own_lock = &c->lock;
-  wev->own_lock = &c->lock;
-#endif
-
-  rev->channel = 1;
-  wev->channel = 1;
-
-  rev->handler = NgxBaseFetch::event_handler;
-
-  // only EPOLL event has both add_event and add_connection
-  // same as ngx_add_channel_event
-  if (ngx_add_conn && (ngx_event_flags & NGX_USE_EPOLL_EVENT) == 0) {
-	if (ngx_add_conn(c) == NGX_ERROR) {
-	  ngx_free_connection(c);
-	  goto failed;
-	}
-  } else {
-	if (ngx_add_event(rev, NGX_READ_EVENT, 0) == NGX_ERROR) {
-	  ngx_free_connection(c);
-	  goto failed;
-	}
-  }
-
-  pipe_conn_ = c;
-  return NGX_OK;
- failed:
-
-  if (close(pipefds_[0]) == -1) {
-	ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-		"close() base fetch pipe[0] failed");
-  }
-  if (close(pipefds_[1]) == -1) {
-	ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-		"close() base fetch pipe[1] failed");
-  }
-  return NGX_ERROR;
-}
-
-void NgxBaseFetch::terminate(ngx_cycle_t *cycle) {
-  if (pipe_conn_ == NULL) {
-	return;
-  }
-
-  if (close(pipefds_[0]) == -1) {
-	ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-		 "close() base fetch pipe[0] failed");
-  }
-  if (close(pipefds_[1]) == -1) {
-	ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-		 "close() base fetch pipe[1] failed");
-  }
-}
-
-void NgxBaseFetch::signal(ngx_http_request_t *r) {
-  ssize_t size = 0;
-
-  ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-				 "base fetch signal");
-
-  while (true) {
-	size = write(pipefds_[1], static_cast<void *>(&r),
-		  sizeof(r));
-	if (size == -1 && errno == EINTR) {
-	  continue;
-	}
-	return;
-  }
+  ngx_log_debug0(NGX_LOG_DEBUG_EVENT, ev->log, 0, "NgxBaseFetch::event_handler");
+  ProcessPipe(NULL);
 }
 
 NgxBaseFetch::NgxBaseFetch(ngx_http_request_t* r,
@@ -202,80 +178,21 @@ NgxBaseFetch::NgxBaseFetch(ngx_http_request_t* r,
       done_called_(false),
       last_buf_sent_(false),
       references_(2),
-      flush_(false) {
-  if (pthread_mutex_init(&mutex_, NULL)) CHECK(0);
+      pending_(false),
+      mutex_(server_context->thread_system()->NewMutex())
+      {
+  count_.BarrierIncrement(1);
   PopulateRequestHeaders();
 }
 
 NgxBaseFetch::~NgxBaseFetch() {
-  pthread_mutex_destroy(&mutex_);
-}
-
-void NgxBaseFetch::Lock() {
-  pthread_mutex_lock(&mutex_);
-}
-
-void NgxBaseFetch::Unlock() {
-  pthread_mutex_unlock(&mutex_);
-}
-
-void NgxBaseFetch::PopulateRequestHeaders() {
-  CopyHeadersFromTable<RequestHeaders>(&request_->headers_in.headers,
-                                       request_headers());
-}
-
-void NgxBaseFetch::PopulateResponseHeaders() {
-  CopyHeadersFromTable<ResponseHeaders>(&request_->headers_out.headers,
-                                        response_headers());
-
-  response_headers()->set_status_code(request_->headers_out.status);
-
-  // Manually copy over the content type because it's not included in
-  // request_->headers_out.headers.
-  response_headers()->Add(
-      HttpAttributes::kContentType,
-      ngx_psol::str_to_string_piece(request_->headers_out.content_type));
-
-  // TODO(oschaaf): ComputeCaching should be called in setupforhtml()?
-  response_headers()->ComputeCaching();
-}
-
-template<class HeadersT>
-void NgxBaseFetch::CopyHeadersFromTable(ngx_list_t* headers_from,
-                                        HeadersT* headers_to) {
-  // http_version is the version number of protocol; 1.1 = 1001. See
-  // NGX_HTTP_VERSION_* in ngx_http_request.h
-  headers_to->set_major_version(request_->http_version / 1000);
-  headers_to->set_minor_version(request_->http_version % 1000);
-
-  // Standard nginx idiom for iterating over a list.  See ngx_list.h
-  ngx_uint_t i;
-  ngx_list_part_t* part = &headers_from->part;
-  ngx_table_elt_t* header = static_cast<ngx_table_elt_t*>(part->elts);
-
-  for (i = 0 ; /* void */; i++) {
-    if (i >= part->nelts) {
-      if (part->next == NULL) {
-        break;
-      }
-
-      part = part->next;
-      header = static_cast<ngx_table_elt_t*>(part->elts);
-      i = 0;
-    }
-
-    StringPiece key = ngx_psol::str_to_string_piece(header[i].key);
-    StringPiece value = ngx_psol::str_to_string_piece(header[i].value);
-
-    headers_to->Add(key, value);
-  }
+  count_.BarrierIncrement(-1);
 }
 
 bool NgxBaseFetch::HandleWrite(const StringPiece& sp,
                                MessageHandler* handler) {
-  Lock();
+  ScopedMutex scoped_mutex(mutex_.get());
   buffer_.append(sp.data(), sp.size());
-  Unlock();
   return true;
 }
 
@@ -308,35 +225,40 @@ ngx_int_t NgxBaseFetch::CopyBufferToNginx(ngx_chain_t** link_ptr) {
 // think nginx will reject.
 ngx_int_t NgxBaseFetch::CollectAccumulatedWrites(ngx_chain_t** link_ptr) {
   ngx_int_t rc = NGX_DECLINED;
-  Lock();
-  if (flush_) {
+  *link_ptr = NULL;
+
+  ScopedMutex scoped_mutex(mutex_.get());
+
+  if (pending_) {
     rc = CopyBufferToNginx(link_ptr);
-    flush_ = false;
-  }
-  Unlock();
-  if (rc == NGX_DECLINED) {
-    *link_ptr = NULL;
+    pending_ = false;
   }
   return rc;
 }
 
 void NgxBaseFetch::RequestCollection() {
-  Lock();
-  if (flush_) {
-    Unlock();
+  // TODO: lock etc
+  ScopedMutex scoped_mutex(mutex_.get());
+  if (pending_) {
     return;
   }
-  flush_ = true;
-  ngx_psol::ps_base_fetch_signal(request_);
-  Unlock();
-  return;
+
+  pending_ = true;
+  ngx_log_debug0(NGX_LOG_DEBUG_HTTP, request_->connection->log, 0,
+			   "base fetch signal");
+	
+  while (true) {
+    ssize_t size = write(pipefds_[1], static_cast<void *>(&request_), sizeof(r));
+    if (size == -1 && errno == EINTR) {
+      continue;
+    }
+    return;
+  }
 }
 
 
 ngx_int_t NgxBaseFetch::CollectHeaders(ngx_http_headers_out_t* headers_out) {
-  Lock();
   const ResponseHeaders* pagespeed_headers = response_headers();
-  Unlock();
   return ngx_psol::copy_response_headers_to_ngx(request_, *pagespeed_headers);
 }
 
@@ -355,15 +277,11 @@ bool NgxBaseFetch::HandleFlush(MessageHandler* handler) {
 }
 
 void NgxBaseFetch::Release() {
-  Lock();
-  flush_ = true;
-  Unlock();
-  DecrefAndDeleteIfUnreferenced();
-}
-
-void NgxBaseFetch::DecrefAndDeleteIfUnreferenced() {
-  // Creates a full memory barrier.
-  if (__sync_add_and_fetch(&references_, -1) == 0) {
+  ScopedMutex scoped_mutex(mutex_.get());
+  pending_ = true;
+  scoped_mutex.Release();
+  ProcessPipe(request_);
+  if (references_.BarrierIncrement(-1) == 0) {
     delete this;
   }
 }
@@ -371,25 +289,20 @@ void NgxBaseFetch::DecrefAndDeleteIfUnreferenced() {
 void NgxBaseFetch::HandleDone(bool success) {
   // TODO(jefftk): it's possible that instead of locking here we can just modify
   // CopyBufferToNginx to only read done_called_ once.
-
+  ScopedMutex scoped_mutex(mutex_.get());
   if (done_called_ == true) {
-    return;
-  }
-
-  Lock();
-  if (done_called_ == true) {
-    Unlock();
     return;
   }
 
   done_called_ = true;
-  if (!flush_) {
-    flush_ = true;
+  if (!pending_) {
+    pending_ = true;
     ngx_psol::ps_base_fetch_signal(request_);
   }
 
-  Unlock();
-  DecrefAndDeleteIfUnreferenced();
+  if (references_.BarrierIncrement(-1) == 0) {
+    delete this;
+  }
 }
 
 }  // namespace net_instaweb

@@ -123,12 +123,13 @@ class NgxBaseFetch : public AsyncFetch {
   bool last_buf_sent_;
   // How many active references there are to this fetch. Starts at two,
   // decremented once when Done() is called and once when Release() is called.
-  int references_;
-  pthread_mutex_t mutex_;
+  AtomicInt32 references_;
+  scoped_ptr<AbstractMutex> mutex_;
 
   // set by RequestCollection, cleared by CollectAccumulatedWrites
-  volatile bool flush_;
+  bool pending_;
 
+  static AtomicInt32 num_instance_;
   static ngx_connection_t *pipe_conn_;
   static int pipefds_[2];
 
